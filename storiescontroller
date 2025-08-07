@@ -1,0 +1,305 @@
+//stories controller
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using TrabalhoFinal.Api.Data;
+using TrabalhoFinal.Api.DTOs;
+using TrabalhoFinal.Api.Models;
+
+namespace TrabalhoFinal.Api.Controllers
+{
+    [ApiController]
+    [Route("api/stories")]
+    public class StoriesController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+        private readonly IWebHostEnvironment _env;
+
+        public StoriesController(AppDbContext context, IWebHostEnvironment env)
+        {
+            _context = context;
+            _env = env;
+        }
+
+        // Criação do story com upload da imagem
+        [HttpPost]
+        public async Task<IActionResult> CriarStory([FromForm] StorieCadastroRequest dados)
+        {
+            if (dados.Imagem == null || dados.Imagem.Length == 0)
+                return BadRequest(new { mensagem = "Nenhuma imagem enviada." });
+
+            var usuarioExiste = await _context.Usuarios.AnyAsync(u => u.Id == dados.UsuarioId);
+            if (!usuarioExiste)
+                return NotFound("Usuário não encontrado.");
+
+            var uploadsFolder = Path.Combine(_env.WebRootPath ?? Path.Combine(Directory.GetCurrentDirectory(), "wwwroot"), "uploads");
+            if (!Directory.Exists(uploadsFolder)) Directory.CreateDirectory(uploadsFolder);
+
+            var nomeArquivo = $"{Guid.NewGuid()}{Path.GetExtension(dados.Imagem.FileName)}";
+            var caminhoArquivo = Path.Combine(uploadsFolder, nomeArquivo);
+
+            await using var stream = new FileStream(caminhoArquivo, FileMode.Create);
+            await dados.Imagem.CopyToAsync(stream);
+
+            var story = new Story
+            {
+                UsuarioId = dados.UsuarioId,
+                ImagemUrl = $"/uploads/{nomeArquivo}",
+                Legenda = dados.Legenda,
+                CriadoEm = DateTime.Now,
+                ExpiraEm = DateTime.Now.AddHours(12),
+                Ativo = true
+            };
+
+            _context.Stories.Add(story);
+            await _context.SaveChangesAsync();
+
+            return Ok(new { mensagem = "Story publicado com sucesso.", storyId = story.Id });
+        }
+
+        // Lista stories ativos de um usuário específico
+        [HttpGet("usuario/{usuarioId}")]
+        public async Task<IActionResult> ListarStories(int usuarioId)
+        {
+            var agora = DateTime.Now;
+
+            // Atualiza stories expirados para inativos
+            var expirados = await _context.Stories.Where(s => s.ExpiraEm <= agora && s.Ativo).ToListAsync();
+            expirados.ForEach(s => s.Ativo = false);
+            await _context.SaveChangesAsync();
+
+            var stories = await _context.Stories
+                .Include(s => s.Usuario)
+                .Where(s => s.UsuarioId == usuarioId && s.Ativo)
+                .OrderByDescending(s => s.CriadoEm)
+                .Select(s => new
+                {
+                    s.Id,
+                    s.Legenda,
+                    ImagemUrl = $"{Request.Scheme}://{Request.Host}{s.ImagemUrl}",
+                    s.CriadoEm,
+                    Usuario = new
+                    {
+                        s.Usuario.Id,
+                        s.Usuario.Nome,
+                        s.Usuario.NomeUsuario,
+                        s.Usuario.FotoPerfil
+                    },
+                    Curtidas = _context.CurtidasStories.Count(c => c.StoryId == s.Id)
+                })
+                .ToListAsync();
+
+            return Ok(stories);
+        }
+        // StoriesController.cs
+
+
+        [HttpGet("feed/{usuarioId}")]
+        public async Task<IActionResult> ListarStoriesFeed(int usuarioId)
+        {
+            var agora = DateTime.Now;
+
+            // Atualiza stories expirados para inativos
+            var expirados = await _context.Stories
+                .Where(s => s.ExpiraEm <= agora && s.Ativo)
+                .ToListAsync();
+
+            expirados.ForEach(s => s.Ativo = false);
+            await _context.SaveChangesAsync();
+
+            var seguindoIds = await _context.SolicitacoesSeguir
+                .Where(s => s.Solicitante_Id == usuarioId && s.Status == "aceita")
+                .Select(s => s.Solicitado_Id)
+                .ToListAsync();
+
+            seguindoIds.Add(usuarioId);
+
+            var stories = await _context.Stories
+                .Include(s => s.Usuario)
+                .Where(s => seguindoIds.Contains(s.UsuarioId) && s.Ativo)
+                .OrderByDescending(s => s.CriadoEm)
+                .Select(s => new
+                {
+                    s.Id,
+                    s.Legenda,
+                    ImagemUrl = $"{Request.Scheme}://{Request.Host}{s.ImagemUrl}",
+                    s.CriadoEm,
+                    Usuario = new
+                    {
+                        s.Usuario.Id,
+                        s.Usuario.Nome,
+                        s.Usuario.NomeUsuario,
+                        s.Usuario.FotoPerfil
+                    },
+                    Curtidas = _context.CurtidasStories.Count(c => c.StoryId == s.Id),
+                    CurtidoPeloUsuarioAtual = _context.CurtidasStories
+                        .Any(c => c.StoryId == s.Id && c.UsuarioId == usuarioId)
+                })
+                .ToListAsync();
+
+            return Ok(stories);
+        }
+
+        [HttpPost("curtir")]
+        public async Task<IActionResult> Curtir([FromBody] CurtidaStoryRequest dto)
+        {
+            Console.WriteLine($"Curtir - UsuarioId: {dto.UsuarioId}, StoryId: {dto.StoryId}");
+
+            if (dto.UsuarioId <= 0 || dto.StoryId <= 0)
+                return BadRequest("IDs inválidos");
+
+            var story = await _context.Stories.FindAsync(dto.StoryId);
+            if (story == null || !story.Ativo)
+                return NotFound("Story não encontrado ou expirado");
+
+            var jaCurtiu = await _context.CurtidasStories
+                .AnyAsync(c => c.StoryId == dto.StoryId && c.UsuarioId == dto.UsuarioId);
+
+            if (jaCurtiu)
+                return Ok(new
+                {
+                    sucesso = true,
+                    totalCurtidas = await _context.CurtidasStories.CountAsync(c => c.StoryId == dto.StoryId),
+                    curtidoPorMim = true
+                });
+
+            var curtida = new CurtidaStory
+            {
+                StoryId = dto.StoryId,
+                UsuarioId = dto.UsuarioId,
+                CriadoEm = DateTime.Now
+            };
+
+            _context.CurtidasStories.Add(curtida);
+            await _context.SaveChangesAsync();
+
+            var totalCurtidas = await _context.CurtidasStories
+                .CountAsync(c => c.StoryId == dto.StoryId);
+
+            return Ok(new
+            {
+                sucesso = true,
+                totalCurtidas,
+                curtidoPorMim = true
+            });
+        }
+
+        [HttpDelete("remover-curtida")]
+        public async Task<IActionResult> RemoverCurtida([FromQuery] int usuarioId, [FromQuery] int storyId)
+        {
+            Console.WriteLine($"RemoverCurtida - UsuarioId: {usuarioId}, StoryId: {storyId}");
+
+            var curtida = await _context.CurtidasStories
+                .FirstOrDefaultAsync(c => c.StoryId == storyId && c.UsuarioId == usuarioId);
+
+            if (curtida == null)
+                return Ok(new
+                {
+                    sucesso = true,
+                    totalCurtidas = await _context.CurtidasStories.CountAsync(c => c.StoryId == storyId),
+                    curtidoPorMim = false
+                });
+
+            _context.CurtidasStories.Remove(curtida);
+            await _context.SaveChangesAsync();
+
+            var totalCurtidas = await _context.CurtidasStories
+                .CountAsync(c => c.StoryId == storyId);
+
+            return Ok(new
+            {
+                sucesso = true,
+                totalCurtidas,
+                curtidoPorMim = false
+            });
+        }
+
+
+        // Responder um story via mensagem
+        [HttpPost("responder")]
+        public async Task<IActionResult> ResponderStory([FromBody] RespostaStoryDto dto)
+        {
+            var story = await _context.Stories.Include(s => s.Usuario).FirstOrDefaultAsync(s => s.Id == dto.StoryId && s.Ativo);
+            if (story == null)
+                return NotFound("Story não encontrado ou expirado.");
+
+            var remetenteExiste = await _context.Usuarios.AnyAsync(u => u.Id == dto.RemetenteId);
+            if (!remetenteExiste)
+                return NotFound("Remetente não encontrado.");
+
+            var mensagem = new Mensagem
+            {
+                RemetenteId = dto.RemetenteId,
+                DestinatarioId = story.UsuarioId,
+                Texto = dto.Texto,
+                CriadoEm = DateTime.Now,
+                ReferenciaStoryId = dto.StoryId,
+                Entregue = true
+            };
+
+            _context.Mensagens.Add(mensagem);
+
+            // Criar notificação
+            var remetente = await _context.Usuarios.FirstOrDefaultAsync(u => u.Id == dto.RemetenteId);
+            var notificacao = new Notificacao
+            {
+                UsuarioId = story.UsuarioId,
+                Tipo = "mensagem",
+                Conteudo = $"@{remetente?.NomeUsuario ?? "alguém"} respondeu ao seu story."
+            };
+            _context.Notificacoes.Add(notificacao);
+
+            await _context.SaveChangesAsync();
+
+            return Ok("Resposta enviada com sucesso.");
+        }
+
+        // Excluir story
+        [HttpDelete("{storyId}")]
+        public async Task<IActionResult> ExcluirStory(int storyId, [FromQuery] int usuarioId)
+        {
+            var story = await _context.Stories.FirstOrDefaultAsync(s => s.Id == storyId);
+            if (story == null)
+                return NotFound("Story não encontrado.");
+
+            if (story.UsuarioId != usuarioId)
+                return Forbid("Você não tem permissão para excluir este story.");
+
+            // Excluir todas as curtidas associadas ao story
+            var curtidas = _context.CurtidasStories.Where(c => c.StoryId == storyId);
+            _context.CurtidasStories.RemoveRange(curtidas);  // Remove as curtidas associadas ao story
+
+            // Excluir o story
+            _context.Stories.Remove(story);
+            await _context.SaveChangesAsync();
+
+            return Ok("Story excluído com sucesso.");
+        }
+
+
+        [HttpGet("{storyId}/respostas")]
+        public async Task<IActionResult> ListarRespostas(int storyId)
+        {
+            var respostas = await _context.Mensagens
+                .Include(m => m.Remetente) // Certifique-se de incluir o Remetente
+                .Where(m => m.ReferenciaStoryId == storyId)
+                .OrderByDescending(m => m.CriadoEm)
+                .Select(m => new
+                {
+                    m.Id,
+                    m.Texto,
+                    m.CriadoEm,
+                    Remetente = new // Agora Remetente existe
+                    {
+                        m.Remetente.Id,
+                        m.Remetente.NomeUsuario,
+                        m.Remetente.FotoPerfil
+                    }
+                })
+                .ToListAsync();
+                
+            return Ok(respostas);
+        }
+
+
+    }
+}
