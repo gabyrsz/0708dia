@@ -1,0 +1,176 @@
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using TrabalhoFinal.Api.Data;
+using TrabalhoFinal.Api.DTOs;
+using TrabalhoFinal.Api.Models;
+
+namespace TrabalhoFinal.Api.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class PerfisController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+        private readonly IWebHostEnvironment _env;
+
+        public PerfisController(AppDbContext context, IWebHostEnvironment env)
+        {
+            _context = context;
+            _env = env;
+        }
+
+        // GET /api/perfis/{perfilId}?visualizadorId=?
+        [HttpGet("{perfilId}")]
+        public IActionResult VerPerfil(int perfilId, [FromQuery] int? visualizadorId)
+        {
+            var usuario = _context.Usuarios.FirstOrDefault(u => u.Id == perfilId);
+            if (usuario == null)
+                return NotFound();
+
+            string statusSolicitacao = "nenhuma";
+            bool conteudoLiberado = usuario.Publico;
+
+            if (visualizadorId.HasValue)
+            {
+                var solicitacao = _context.SolicitacoesSeguir
+                    .Where(s =>
+                        s.Solicitante_Id == visualizadorId &&
+                        s.Solicitado_Id == perfilId)
+                    .OrderByDescending(s => s.CriadoEm)
+                    .FirstOrDefault();
+
+                if (solicitacao != null)
+                {
+                    statusSolicitacao = solicitacao.Status;
+                    if (solicitacao.Status == "aceita")
+                        conteudoLiberado = true;
+                }
+            }
+
+            var seguidores = _context.SolicitacoesSeguir
+                .Count(s => s.Solicitado_Id == perfilId && s.Status == "aceita");
+
+            var seguindo = _context.SolicitacoesSeguir
+                .Count(s => s.Solicitante_Id == perfilId && s.Status == "aceita");
+
+            var posts = new List<object>();
+            if (conteudoLiberado)
+            {
+                posts = _context.Posts
+                    .Where(p => p.UsuarioId == perfilId)
+                    .Include(p => p.Midias)
+                    .Include(p => p.Usuario)
+                    .OrderByDescending(p => p.CriadoEm)
+                    .Select(p => new
+                    {
+                        p.Id,
+                        p.Legenda,
+                        p.Localizacao,
+                        p.CriadoEm,
+                        p.UsuarioId,
+                        Midias = p.Midias.Select(m => new
+                        {
+                            m.Id,
+                            m.Tipo,
+                            Url = $"{Request.Scheme}://{Request.Host}{m.Url}",
+                            m.Filtro
+                        }),
+                        Autor = new
+                        {
+                            p.Usuario.Id,
+                            p.Usuario.Nome,
+                            p.Usuario.NomeUsuario,
+                            FotoPerfil = string.IsNullOrEmpty(p.Usuario.FotoPerfil) ? null : $"{Request.Scheme}://{Request.Host}{p.Usuario.FotoPerfil}"
+                        }
+                    })
+                    .Cast<object>()
+                    .ToList();
+            }
+
+            var storys = new List<object>();
+            if (conteudoLiberado)
+            {
+                storys = _context.Stories
+                    .Where(s => s.UsuarioId == perfilId && s.Ativo)
+                    .Include(s => s.Usuario)
+                    .OrderByDescending(s => s.CriadoEm)
+                    .Select(s => new
+                    {
+                        s.Id,
+                        s.UsuarioId,
+                        s.Ativo,
+                        s.CriadoEm,
+                        ImagemUrl = $"{Request.Scheme}://{Request.Host}{s.ImagemUrl}",
+                        Usuario = new
+                        {
+                            s.Usuario.Id,
+                            s.Usuario.Nome,
+                            s.Usuario.NomeUsuario,
+                            FotoPerfil = string.IsNullOrEmpty(s.Usuario.FotoPerfil) ? null : $"{Request.Scheme}://{Request.Host}{s.Usuario.FotoPerfil}"
+                        }
+                    })
+                    .Cast<object>()
+                    .ToList();
+            }
+
+            return Ok(new
+            {
+                usuario.Id,
+                usuario.Nome,
+                usuario.NomeUsuario,
+                FotoPerfil = string.IsNullOrEmpty(usuario.FotoPerfil) ? null : $"{Request.Scheme}://{Request.Host}{usuario.FotoPerfil}",
+                usuario.Biografia,
+                ConteudoLiberado = conteudoLiberado,
+                StatusSolicitacao = statusSolicitacao,
+                Seguidores = seguidores,
+                Seguindo = seguindo,
+                Posts = posts,
+                Storys = storys
+            });
+        }
+
+        [HttpPut("editar")]
+        public async Task<IActionResult> EditarPerfil([FromQuery] int usuarioId, [FromForm] UsuarioEditarRequest dto)
+        {
+            var usuario = await _context.Usuarios.FindAsync(usuarioId);
+            if (usuario == null)
+                return NotFound(new { mensagem = "Usuário não encontrado." });
+
+            if (!string.IsNullOrWhiteSpace(dto.Nome)) usuario.Nome = dto.Nome;
+            if (!string.IsNullOrWhiteSpace(dto.NomeUsuario)) usuario.NomeUsuario = dto.NomeUsuario;
+            if (!string.IsNullOrWhiteSpace(dto.Biografia)) usuario.Biografia = dto.Biografia;
+            if (dto.Publico.HasValue) usuario.Publico = dto.Publico.Value;
+
+            if (dto.RemoverFotoPerfil.HasValue && dto.RemoverFotoPerfil.Value)
+            {
+                if (!string.IsNullOrWhiteSpace(usuario.FotoPerfil))
+                {
+                    var filePath = Path.Combine(_env.WebRootPath ?? "wwwroot", usuario.FotoPerfil.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+                    if (System.IO.File.Exists(filePath))
+                        System.IO.File.Delete(filePath);
+
+                    usuario.FotoPerfil = null;
+                }
+            }
+
+            if (dto.FotoPerfil != null && dto.FotoPerfil.Length > 0)
+            {
+                var uploadsPath = Path.Combine(_env.WebRootPath ?? "wwwroot", "uploads");
+                if (!Directory.Exists(uploadsPath)) Directory.CreateDirectory(uploadsPath);
+
+                var fileName = $"{Guid.NewGuid()}{Path.GetExtension(dto.FotoPerfil.FileName)}";
+                var filePath = Path.Combine(uploadsPath, fileName);
+
+                using (var stream = new FileStream(filePath, FileMode.Create))
+                {
+                    await dto.FotoPerfil.CopyToAsync(stream);
+                }
+
+                usuario.FotoPerfil = $"/uploads/{fileName}";
+            }
+
+            await _context.SaveChangesAsync();
+            return Ok(new { mensagem = "Perfil atualizado com sucesso!" });
+        }
+    }
+}
