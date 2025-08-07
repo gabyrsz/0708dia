@@ -1,0 +1,378 @@
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.IdentityModel.Tokens;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+using TrabalhoFinal.Api.Data;
+using TrabalhoFinal.Api.DTOs;
+using TrabalhoFinal.Api.Helpers;
+using TrabalhoFinal.Api.Models;
+using System.Text.RegularExpressions;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+
+namespace TrabalhoFinal.Api.Controllers
+{
+    [ApiController]
+    [Route("api/usuarios")] // Rota explícita para evitar ambiguidades
+    public class UsuariosController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+        private readonly IConfiguration _configuration;
+
+        public UsuariosController(AppDbContext context, IConfiguration configuration)
+        {
+            _context = context;
+            _configuration = configuration;
+        }
+
+        // REGISTRAR USUÁRIO
+        [HttpPost("registrar")]
+        public IActionResult Registrar([FromBody] Usuario usuario)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            // Verificações de unicidade e formato
+            if (_context.Usuarios.Any(u => u.Email == usuario.Email))
+                return BadRequest(new { mensagem = "E-mail já cadastrado." });
+
+            if (_context.Usuarios.Any(u => u.NomeUsuario == usuario.NomeUsuario))
+                return BadRequest(new { mensagem = "Nome de usuário já está em uso." });
+
+            if (_context.Usuarios.Any(u => u.Whatsapp == usuario.Whatsapp))
+                return BadRequest(new { mensagem = "Número de WhatsApp já cadastrado." });
+
+            if (!Regex.IsMatch(usuario.Whatsapp, @"^55\d{10,11}$"))
+                return BadRequest(new { mensagem = "Número de WhatsApp inválido. Deve incluir DDD e 9 dígitos." });
+
+            if (usuario.SenhaHash.Length < 6)
+                return BadRequest(new { mensagem = "A senha deve ter pelo menos 6 caracteres." });
+
+            // Hash da senha antes de salvar
+            usuario.SenhaHash = SenhaHelper.GerarHash(usuario.SenhaHash);
+
+            _context.Usuarios.Add(usuario);
+            _context.SaveChanges();
+
+            return Ok(new { mensagem = "Usuário registrado com sucesso!", usuario.Id });
+        }
+
+        // LOGIN
+        [HttpPost("login")]
+        public IActionResult Login([FromBody] LoginRequest login)
+        {
+            var senhaHash = SenhaHelper.GerarHash(login.SenhaHash);
+            var usuario = _context.Usuarios.FirstOrDefault(u => u.Email == login.Email && u.SenhaHash == senhaHash);
+
+            if (usuario == null)
+                return Unauthorized(new { mensagem = "E-mail ou senha inválidos." });
+
+            var token = GerarTokenJWT(usuario);
+            return Ok(new { token });
+        }
+
+        // GERA TOKEN JWT
+        private string GerarTokenJWT(Usuario usuario)
+        {
+            var jwtSettings = _configuration.GetSection("Jwt");
+            var key = Encoding.ASCII.GetBytes(jwtSettings["Key"]);
+
+            var tokenDescriptor = new SecurityTokenDescriptor
+            {
+                Subject = new ClaimsIdentity(new[]
+                {
+                    new Claim(ClaimTypes.NameIdentifier, usuario.Id.ToString()),
+                    new Claim(ClaimTypes.Name, usuario.Nome),
+                    new Claim(ClaimTypes.Email, usuario.Email)
+                }),
+                Expires = DateTime.UtcNow.AddHours(2),
+                Issuer = jwtSettings["Issuer"],
+                Audience = jwtSettings["Audience"],
+                SigningCredentials = new SigningCredentials(
+                    new SymmetricSecurityKey(key),
+                    SecurityAlgorithms.HmacSha256Signature)
+            };
+
+            var tokenHandler = new JwtSecurityTokenHandler();
+            var token = tokenHandler.CreateToken(tokenDescriptor);
+            return tokenHandler.WriteToken(token);
+        }
+
+        // LISTAR TODOS OS USUÁRIOS (sem filtros)
+        [HttpGet]
+        public IActionResult Listar()
+        {
+            // Retorna lista completa de usuários (atenção com dados sensíveis no front)
+            return Ok(_context.Usuarios.ToList());
+        }
+
+        // ENDPOINT PARA TESTE DO SWAGGER
+        [HttpGet("teste-swagger")]
+        public IActionResult TesteSwagger()
+        {
+            return Ok(new { mensagem = "Endpoint visível no Swagger!" });
+        }
+
+        // BUSCAR SUGESTÕES PARA CAMPO DE PESQUISA
+        [HttpGet("pesquisa/sugestoes")]
+        public IActionResult BuscarSugestoes([FromQuery] string q)
+        {
+            if (string.IsNullOrWhiteSpace(q))
+                return Ok(new { resultados = new List<object>() });
+
+            var termo = q.Trim();
+
+            var usuarios = _context.Usuarios
+                .Where(u =>
+                    EF.Functions.Like(u.Nome, $"%{termo}%") ||
+                    EF.Functions.Like(u.NomeUsuario, $"%{termo}%"))
+                .Select(u => new
+                {
+                    id = u.Id,
+                    nome = u.Nome,
+                    nomeUsuario = u.NomeUsuario,
+                    fotoPerfil = string.IsNullOrEmpty(u.FotoPerfil)
+                        ? null
+                        : $"{Request.Scheme}://{Request.Host}{u.FotoPerfil}",
+                    tipo = "usuario"
+                })
+                .Take(10)
+                .ToList();
+
+            return Ok(new { resultados = usuarios });
+        }
+
+        // LISTAR SEGUIDORES APROVADOS (para um usuário)
+        [HttpGet("{usuarioId}/seguidores-aprovados")]
+        public IActionResult ListarSeguidoresAprovados(int usuarioId)
+        {
+            var seguidores = _context.SolicitacoesSeguir
+                .Where(s => s.Solicitado_Id == usuarioId && s.Status == "aceita")
+                .Select(s => s.Solicitante_Id)
+                .ToList();
+
+            var dados = _context.Usuarios
+                .Where(u => seguidores.Contains(u.Id))
+                .Select(u => new
+                {
+                    id = u.Id, // Adicionando o ID
+                    u.Nome,
+                    u.NomeUsuario,
+                    u.FotoPerfil
+                })
+                .ToList();
+
+            return Ok(dados);
+        }
+
+        // LISTAR USUÁRIOS QUE O USUÁRIO ESTÁ SEGUINDO (aprovados)
+        [HttpGet("{usuarioId}/seguindo")]
+        public IActionResult ListarSeguindoAprovados(int usuarioId)
+        {
+            var seguindo = _context.SolicitacoesSeguir
+                .Where(s => s.Solicitante_Id == usuarioId && s.Status == "aceita")
+                .Select(s => s.Solicitado_Id)
+                .ToList();
+
+            var dados = _context.Usuarios
+                .Where(u => seguindo.Contains(u.Id))
+                .Select(u => new
+                {
+                    id = u.Id, // Adicionando o ID
+                    u.Nome,
+                    u.NomeUsuario,
+                    u.FotoPerfil
+                })
+                .ToList();
+
+            return Ok(dados);
+        }
+
+        // REMOVER SEGUIDOR
+        [HttpDelete("remover-seguidor")]
+        public IActionResult RemoverSeguidor([FromQuery] int solicitadoId, [FromQuery] int seguidorId)
+        {
+            var solicitacao = _context.SolicitacoesSeguir.FirstOrDefault(s =>
+                s.Solicitado_Id == solicitadoId &&
+                s.Solicitante_Id == seguidorId &&
+                s.Status == "aceita"
+            );
+
+            if (solicitacao == null)
+                return NotFound(new { mensagem = "Este usuário não está na sua lista de seguidores." });
+
+            _context.SolicitacoesSeguir.Remove(solicitacao);
+            _context.SaveChanges();
+
+            return Ok(new { mensagem = "Seguidor removido com sucesso." });
+        }
+
+        [HttpGet("{usuarioId}")]
+        public IActionResult ObterPerfil(int usuarioId)
+        {
+            var usuarioLogadoIdString = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            if (!int.TryParse(usuarioLogadoIdString, out int usuarioLogadoId))
+            {
+                return Unauthorized(new { mensagem = "Usuário não autenticado." });
+            }
+
+            var usuario = _context.Usuarios
+                .Where(u => u.Id == usuarioId)
+                .Select(u => new
+                {
+                    u.Id,
+                    u.Nome,
+                    u.NomeUsuario,
+                    u.Email,
+                    FotoPerfil = string.IsNullOrEmpty(u.FotoPerfil) ? null : $"{Request.Scheme}://{Request.Host}{u.FotoPerfil}",
+                    u.Biografia,
+                    u.Whatsapp,
+                    Publico = u.Publico // importante que o nome esteja igual
+                })
+                .FirstOrDefault();
+
+            if (usuario == null)
+                return NotFound(new { mensagem = "Usuário não encontrado." });
+
+            // Verificar se usuário logado segue o perfil
+            bool jaSegue = _context.SolicitacoesSeguir
+                .Any(s => s.Solicitante_Id == usuarioLogadoId && s.Solicitado_Id == usuarioId && s.Status == "aceita");
+
+            // Pega posts e stories
+            var posts = _context.Posts
+                .Where(p => p.UsuarioId == usuarioId)
+                .OrderByDescending(p => p.CriadoEm)
+                .Select(p => new
+                {
+                    p.Id,
+                    p.Legenda,
+                    p.CriadoEm,
+                    Midias = _context.MidiasPost
+                        .Where(m => m.PostId == p.Id)
+                        .Select(m => new
+                        {
+                            m.Id,
+                            Url = $"{Request.Scheme}://{Request.Host}{m.Url}",
+                            m.Tipo
+                        }).ToList(),
+                    Curtidas = _context.Curtidas
+                        .Where(c => c.PostId == p.Id)
+                        .Select(c => new { c.UsuarioId }).ToList()
+                })
+                .ToList();
+
+            var storys = _context.Stories
+                .Where(s => s.UsuarioId == usuarioId && s.CriadoEm > DateTime.UtcNow.AddHours(-12))
+                .Select(s => new
+                {
+                    s.Id,
+                    s.ImagemUrl,
+                    s.Legenda,
+                    s.CriadoEm,
+                    s.ExpiraEm
+                })
+                .ToList();
+
+            // Seguidores e seguindo (aprovados)
+            var seguidores = _context.SolicitacoesSeguir
+                .Where(s => s.Solicitado_Id == usuarioId && s.Status == "aceita")
+                .Select(s => new
+                {
+                    s.Solicitante.Id,
+                    s.Solicitante.Nome,
+                    s.Solicitante.NomeUsuario,
+                    FotoPerfil = string.IsNullOrEmpty(s.Solicitante.FotoPerfil) ? null : $"{Request.Scheme}://{Request.Host}{s.Solicitante.FotoPerfil}"
+                })
+                .ToList();
+
+            var seguindo = _context.SolicitacoesSeguir
+                .Where(s => s.Solicitante_Id == usuarioId && s.Status == "aceita")
+                .Select(s => new
+                {
+                    s.Solicitado.Id,
+                    s.Solicitado.Nome,
+                    s.Solicitado.NomeUsuario,
+                    FotoPerfil = string.IsNullOrEmpty(s.Solicitado.FotoPerfil) ? null : $"{Request.Scheme}://{Request.Host}{s.Solicitado.FotoPerfil}"
+                })
+                .ToList();
+
+            return Ok(new
+            {
+                usuario.Id,
+                usuario.Nome,
+                usuario.NomeUsuario,
+                usuario.Email,
+                usuario.FotoPerfil,
+                usuario.Biografia,
+                usuario.Whatsapp,
+                usuario.Publico,
+                JaSegue = jaSegue, // certifique-se que o frontend usa exatamente esse nome
+                Posts = posts,
+                Storys = storys,
+                Seguidores = new
+                {
+                    Quantidade = seguidores.Count,
+                    Lista = seguidores
+                },
+                Seguindo = new
+                {
+                    Quantidade = seguindo.Count,
+                    Lista = seguindo
+                }
+            });
+        }
+
+        // BUSCAR USUÁRIOS RECOMENDADOS
+        [HttpGet("{usuarioId}/recomendados")]
+        public IActionResult BuscarRecomendados(int usuarioId)
+        {
+            // 1. Pegar os IDs que o usuário já segue
+            var seguindoIds = _context.SolicitacoesSeguir
+                .Where(s => s.Solicitante_Id == usuarioId && s.Status == "aceita")
+                .Select(s => s.Solicitado_Id)
+                .ToList();
+
+            // 2. Adicionar o próprio usuário para não se recomendar
+            seguindoIds.Add(usuarioId);
+
+            // 3. Buscar usuários públicos que o usuário não segue
+            var recomendados = _context.Usuarios
+                .Where(u => u.Publico && !seguindoIds.Contains(u.Id))
+                .OrderByDescending(u => u.CriadoEm) // Ordena por mais recentes primeiro
+                .Take(5) // Limita a 5 recomendações
+                .Select(u => new
+                {
+                    u.Id,
+                    u.Nome,
+                    u.NomeUsuario,
+                    FotoPerfil = string.IsNullOrEmpty(u.FotoPerfil)
+                        ? null
+                        : $"{Request.Scheme}://{Request.Host}{u.FotoPerfil}",
+                    RecomendadoPor = "Contas públicas que você ainda não segue"
+                })
+                .ToList();
+
+            return Ok(recomendados);
+        }
+
+        // TESTE DE BUSCA (fixa "gabi" para testes rápidos)
+        [HttpGet("teste-busca-usuarios")]
+        public IActionResult TesteBusca()
+        {
+            string termo = "gabi";
+
+            var usuarios = _context.Usuarios
+                .Where(u => EF.Functions.Like(u.Nome, $"%{termo}%") || EF.Functions.Like(u.NomeUsuario, $"%{termo}%"))
+                .Select(u => new
+                {
+                    u.Id,
+                    u.Nome,
+                    u.NomeUsuario
+                })
+                .ToList();
+
+            return Ok(usuarios);
+        }
+    }
+}
